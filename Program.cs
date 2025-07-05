@@ -1,36 +1,114 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.ComponentModel;
 using System.IO;
 using System.Linq;
 using System.Threading;
+using System.Threading.Tasks;
+using System.Text.RegularExpressions;
+using System.Text.Json;
 using OpenQA.Selenium;
 using OpenQA.Selenium.Chrome;
 using OpenQA.Selenium.Support.UI;
-using System.Threading.Tasks;
-using System.Text.RegularExpressions;
 
 namespace M3U8Extractor
 {
+    // Data Models für hierarchische Struktur
+    public class Episode : INotifyPropertyChanged
+    {
+        public int Number { get; set; }
+        public string M3U8Url { get; set; } = "";
+        public string Title { get; set; } = "";
+        public DateTime? FoundAt { get; set; }
+        public EpisodeStatus Status { get; set; } = EpisodeStatus.Pending;
+        public string ErrorMessage { get; set; } = "";
+
+        public event PropertyChangedEventHandler PropertyChanged;
+
+        public void UpdateStatus(EpisodeStatus status, string message = "")
+        {
+            Status = status;
+            ErrorMessage = message;
+            if (status == EpisodeStatus.Found)
+                FoundAt = DateTime.Now;
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Status)));
+        }
+    }
+
+    public class Season : INotifyPropertyChanged
+    {
+        public int Number { get; set; }
+        public ObservableCollection<Episode> Episodes { get; set; } = new ObservableCollection<Episode>();
+        public int TotalEpisodes => Episodes.Count;
+        public int FoundEpisodes => Episodes.Count(e => e.Status == EpisodeStatus.Found);
+        public int ErrorEpisodes => Episodes.Count(e => e.Status == EpisodeStatus.Error);
+
+        public event PropertyChangedEventHandler PropertyChanged;
+
+        public void NotifyStatsChanged()
+        {
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(FoundEpisodes)));
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(ErrorEpisodes)));
+        }
+    }
+
+    public class Series : INotifyPropertyChanged
+    {
+        public string Name { get; set; } = "";
+        public string CleanName { get; set; } = "";
+        public string BaseUrl { get; set; } = "";
+        public ObservableCollection<Season> Seasons { get; set; } = new ObservableCollection<Season>();
+        public DateTime StartedAt { get; set; } = DateTime.Now;
+        public DateTime? CompletedAt { get; set; }
+
+        public int TotalEpisodes => Seasons.Sum(s => s.TotalEpisodes);
+        public int FoundEpisodes => Seasons.Sum(s => s.FoundEpisodes);
+        public int ErrorEpisodes => Seasons.Sum(s => s.ErrorEpisodes);
+
+        public event PropertyChangedEventHandler PropertyChanged;
+
+        public void NotifyStatsChanged()
+        {
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(TotalEpisodes)));
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(FoundEpisodes)));
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(ErrorEpisodes)));
+        }
+    }
+
+    public enum EpisodeStatus
+    {
+        Pending,
+        Processing,
+        Found,
+        Error,
+        Skipped
+    }
+
+    // Main Extractor Class
     class Program
     {
         private static ChromeDriver driver;
-        private static HashSet<string> capturedUrls = new HashSet<string>();
-        private static string batchFilePath = "yt-dlp_downloads.bat";
+        private static Series currentSeries;
+        private static Season currentSeasonObj;
+        private static Episode currentEpisodeObj;
+
         private static int errorCount = 0;
-        private static int maxErrors = 3;
-        private static string userInputUrl = "";
-        private static int currentSeason = 1;
-        private static List<string> seasonBatches = new List<string>();
+        private static int maxErrors = 10;
         private static string tempProfilePath = "";
+
+        // Live Statistics
+        private static readonly object statsLock = new object();
+        private static DateTime lastStatsUpdate = DateTime.Now;
 
         static async Task Main(string[] args)
         {
-            Console.WriteLine("=== M3U8 URL Extractor für yt-dlp ===");
+            Console.WriteLine("=== M3U8 URL Extractor - Collection Based ===");
             Console.WriteLine();
 
             // User-Eingabe für die Seite
             Console.Write("Geben Sie die URL der ersten Episode ein: ");
-            userInputUrl = Console.ReadLine();
+            var userInputUrl = Console.ReadLine();
 
             if (string.IsNullOrEmpty(userInputUrl))
             {
@@ -38,298 +116,89 @@ namespace M3U8Extractor
                 return;
             }
 
-            Console.WriteLine($"Ziel-URL: {userInputUrl}");
+            // Initialisiere Series Collection
+            currentSeries = new Series
+            {
+                BaseUrl = userInputUrl,
+                Name = ExtractSeriesNameFromUrl(userInputUrl),
+                CleanName = CleanFileName(ExtractSeriesNameFromUrl(userInputUrl))
+            };
+
+            Console.WriteLine($"🎬 Serie: {currentSeries.Name}");
+            Console.WriteLine($"🎯 Basis-URL: {userInputUrl}");
             Console.WriteLine("Drücken Sie ENTER zum Starten...");
             Console.ReadLine();
 
-            // Chrome Driver Setup - Silent (Headless) mit einfachem temporären Profil
-            var options = new ChromeOptions();
-            options.AddArgument("--headless"); // Silent Browser
-            options.AddArgument("--disable-blink-features=AutomationControlled");
-            options.AddExcludedArgument("enable-automation");
-            options.AddAdditionalOption("useAutomationExtension", false);
-            options.AddArgument("--disable-web-security");
-            options.AddArgument("--disable-features=VizDisplayCompositor");
-            options.AddArgument("--disable-gpu");
-            options.AddArgument("--no-sandbox");
-            options.AddArgument("--disable-dev-shm-usage");
-
-            // === OPTIONEN UM STÖRENDE MELDUNGEN ZU UNTERDRÜCKEN ===
-            options.AddArgument("--disable-logging");
-            options.AddArgument("--disable-gpu-sandbox");
-            options.AddArgument("--disable-software-rasterizer");
-            options.AddArgument("--disable-background-timer-throttling");
-            options.AddArgument("--disable-backgrounding-occluded-windows");
-            options.AddArgument("--disable-renderer-backgrounding");
-            options.AddArgument("--disable-features=TranslateUI");
-            options.AddArgument("--disable-ipc-flooding-protection");
-            options.AddArgument("--disable-default-apps");
-            options.AddArgument("--disable-sync");
-            options.AddArgument("--disable-background-networking");
-            options.AddArgument("--disable-component-extensions-with-background-pages");
-            options.AddArgument("--disable-client-side-phishing-detection");
-            options.AddArgument("--disable-hang-monitor");
-            options.AddArgument("--disable-prompt-on-repost");
-            options.AddArgument("--disable-domain-reliability");
-            options.AddArgument("--disable-features=VizDisplayCompositor,VizHitTestSurfaceLayer");
-            options.AddArgument("--log-level=3"); // Nur FATAL-Fehler anzeigen
-            options.AddArgument("--silent");
-
-            // Service-Optionen deaktivieren
-            var service = ChromeDriverService.CreateDefaultService();
-            service.SuppressInitialDiagnosticInformation = true;
-            service.HideCommandPromptWindow = true;
-
-            // Einfaches temporäres Verzeichnis (ohne Chrome-Konflikt)
-            try
-            {
-                tempProfilePath = Path.Combine(Path.GetTempPath(), $"M3U8Extractor_{Guid.NewGuid():N}");
-                Directory.CreateDirectory(tempProfilePath);
-                options.AddArgument($"--user-data-dir={tempProfilePath}");
-                Console.WriteLine("🔇 Silent Browser mit temporärem Profil gestartet");
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"⚠️  Fehler beim Erstellen des temporären Profils: {ex.Message}");
-                Console.WriteLine("⚠️  Verwende Standard-Profil");
-            }
-
-            driver = new ChromeDriver(service, options);
+            // Setup Browser
+            SetupTempProfile();
+            driver = CreateChromeDriver();
 
             try
             {
-                // JavaScript für Netzwerk-Monitoring injizieren
+                // Setup Network Monitoring
                 SetupNetworkMonitoring();
 
-                // Initiale Staffel aus URL ermitteln
-                driver.Navigate().GoToUrl(userInputUrl);
-                await WaitForPageLoad();
-                currentSeason = GetSeasonFromCurrentUrl();
-
-                // Batch-Datei mit Staffel-Nummer initialisieren
-                batchFilePath = $"yt-dlp_downloads_S{currentSeason}.bat";
-                seasonBatches.Add(batchFilePath);
-                InitializeYtDlpBatchFile();
-
-                Console.WriteLine($"🎬 Starte mit Staffel {currentSeason}");
-
-                // Episoden-Extraktion starten
-                await ExtractEpisodesWithErrorHandling();
+                // Starte Extraktion
+                await ExtractSeriesData(userInputUrl);
             }
             catch (Exception ex)
             {
                 LogError($"Kritischer Fehler: {ex.Message}");
-                errorCount = maxErrors; // Sofortiger Abbruch bei kritischen Fehlern
             }
             finally
             {
                 driver?.Quit();
-                FinalizeBatchFile();
-
-                // Temporäres Profil bereinigen
                 CleanupTempProfile(tempProfilePath);
 
-                Console.WriteLine();
-                Console.WriteLine($"Extrahierte URLs: {capturedUrls.Count}");
-                Console.WriteLine($"Aufgetretene Fehler: {errorCount}/{maxErrors}");
-                Console.WriteLine();
-
-                // Liste aller generierten Batch-Dateien
-                if (seasonBatches.Count > 0)
-                {
-                    Console.WriteLine("📄 Generierte Batch-Dateien nach Staffeln:");
-                    foreach (var batch in seasonBatches)
-                    {
-                        if (File.Exists(batch))
-                        {
-                            Console.WriteLine($"   ✅ {batch}");
-                        }
-                    }
-                }
-
-                // Aktuelle Batch-Datei hinzufügen falls noch nicht in der Liste
-                if (File.Exists(batchFilePath) && !seasonBatches.Contains(batchFilePath))
-                {
-                    Console.WriteLine($"   ✅ {batchFilePath}");
-                }
-
-                Console.WriteLine();
-                Console.WriteLine("📝 DATEINAMEN-FORMAT: [SerienName]S[Staffel]F[Folge].mp4");
-                Console.WriteLine("   Beispiel: One_PieceS1F1.mp4, One_PieceS2F1.mp4");
-                Console.WriteLine();
-                Console.WriteLine("🎯 VERWENDUNG:");
-                Console.WriteLine("   Starten Sie jede Batch-Datei einzeln für die gewünschte Staffel");
-                Console.WriteLine("   Oder führen Sie alle nacheinander aus");
-
-                if (errorCount >= maxErrors)
-                {
-                    Console.WriteLine("⚠️  Maximale Fehleranzahl erreicht - Scraping beendet");
-                }
-                else
-                {
-                    Console.WriteLine("✅ Scraping erfolgreich abgeschlossen");
-                }
-
-                Console.WriteLine();
-                Console.WriteLine("Drücken Sie eine Taste zum Beenden...");
-                Console.ReadKey();
+                // Export Results
+                await ExportResults();
+                ShowFinalResults();
             }
         }
 
-        private static void SetupNetworkMonitoring()
+        private static async Task ExtractSeriesData(string startUrl)
         {
-            // Einfaches JavaScript für grundlegendes Monitoring
-            var script = @"
-                window.foundM3U8URLs = [];
-                
-                console.log('*** Basic network monitoring activated ***');
-            ";
+            // Navigiere zur ersten Episode
+            driver.Navigate().GoToUrl(startUrl);
+            await WaitForPageLoad();
 
-            ((IJavaScriptExecutor)driver).ExecuteScript(script);
-            Console.WriteLine("📡 Basis Netzwerk-Monitoring aktiviert");
-        }
+            var startingSeason = GetSeasonFromUrl(startUrl);
+            var startingEpisode = GetEpisodeFromUrl(startUrl);
 
-        private static void CheckForNewM3U8URLs()
-        {
-            try
-            {
-                // Hole gefundene URLs aus dem Browser
-                var foundUrls = ((IJavaScriptExecutor)driver).ExecuteScript("return window.foundM3U8URLs || [];") as System.Collections.ObjectModel.ReadOnlyCollection<object>;
+            Console.WriteLine($"📍 Starte bei Staffel {startingSeason}, Episode {startingEpisode}");
 
-                if (foundUrls != null)
-                {
-                    foreach (var urlObj in foundUrls)
-                    {
-                        var url = urlObj?.ToString();
-                        if (!string.IsNullOrEmpty(url) && !capturedUrls.Contains(url))
-                        {
-                            capturedUrls.Add(url);
-                            Console.WriteLine($"✅ M3U8 URL gefunden: {url}");
-                            AddToYtDlpBatch(url);
-                        }
-                    }
-                }
+            // Initialisiere erste Staffel
+            currentSeasonObj = GetOrCreateSeason(startingSeason);
 
-                // Zusätzlich: Suche nach M3U8 URLs im Seitenquelltext
-                SearchInPageSource();
-
-                // NEUE METHODE: Direkte Suche nach Performance Entries (Network Requests)
-                SearchInPerformanceEntries();
-
-                // Reset der gefundenen URLs im Browser
-                ((IJavaScriptExecutor)driver).ExecuteScript("window.foundM3U8URLs = [];");
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"⚠️  Fehler beim Überprüfen von M3U8 URLs: {ex.Message}");
-            }
-        }
-
-        private static void SearchInPerformanceEntries()
-        {
-            try
-            {
-                // Nutze Performance API um alle Netzwerk-Requests zu finden
-                var script = @"
-                    var entries = performance.getEntriesByType('resource');
-                    var m3u8Urls = [];
-                    entries.forEach(function(entry) {
-                        if (entry.name.includes('.m3u8') || entry.name.includes('master.m3u8') || entry.name.includes('playlist.m3u8')) {
-                            m3u8Urls.push(entry.name);
-                        }
-                    });
-                    return m3u8Urls;
-                ";
-
-                var performanceUrls = ((IJavaScriptExecutor)driver).ExecuteScript(script) as System.Collections.ObjectModel.ReadOnlyCollection<object>;
-
-                if (performanceUrls != null)
-                {
-                    foreach (var urlObj in performanceUrls)
-                    {
-                        var url = urlObj?.ToString();
-                        if (!string.IsNullOrEmpty(url) && !capturedUrls.Contains(url))
-                        {
-                            capturedUrls.Add(url);
-                            Console.WriteLine($"✅ M3U8 URL über Performance API gefunden: {url}");
-                            AddToYtDlpBatch(url);
-                        }
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"⚠️  Fehler bei Performance API Suche: {ex.Message}");
-            }
-        }
-
-        private static void SearchInPageSource()
-        {
-            try
-            {
-                var pageSource = driver.PageSource;
-                var m3u8Pattern = @"https?://[^\s""'<>]+\.m3u8[^\s""'<>]*";
-                var matches = Regex.Matches(pageSource, m3u8Pattern, RegexOptions.IgnoreCase);
-
-                foreach (Match match in matches)
-                {
-                    var url = match.Value.Trim('"', '\'', '<', '>');
-                    if (!capturedUrls.Contains(url))
-                    {
-                        capturedUrls.Add(url);
-                        Console.WriteLine($"✅ M3U8 URL im Quelltext gefunden: {url}");
-                        AddToYtDlpBatch(url);
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"⚠️  Fehler bei Quelltext-Suche: {ex.Message}");
-            }
-        }
-
-        private static async Task ExtractEpisodesWithErrorHandling()
-        {
-            int episodeCounter = 1;
+            int currentSeasonNumber = startingSeason;
+            int currentEpisodeNumber = startingEpisode;
             int consecutiveErrors = 0;
-            int episodesProcessedInCurrentSeason = 0;
+            const int maxConsecutiveErrors = 5;
 
-            while (errorCount < maxErrors)
+            while (errorCount < maxErrors && consecutiveErrors < maxConsecutiveErrors)
             {
                 try
                 {
-                    Console.WriteLine($"\n📺 Verarbeite Staffel {currentSeason}, Episode {episodeCounter}...");
+                    // Prüfe ob wir in neuer Staffel sind
+                    var detectedSeason = GetSeasonFromUrl(driver.Url);
+                    var detectedEpisode = GetEpisodeFromUrl(driver.Url);
 
-                    // Warten bis Seite geladen ist
-                    await WaitForPageLoad();
-
-                    // Prüfe aktuelle Staffel aus URL
-                    var detectedSeason = GetSeasonFromCurrentUrl();
-                    Console.WriteLine($"🔍 Erkannte Staffel aus URL: {detectedSeason}, Aktuelle Staffel: {currentSeason}");
-
-                    // Staffelwechsel erkannt? (Nur wenn es eine höhere Staffel ist UND wir schon Episoden verarbeitet haben)
-                    if (detectedSeason != currentSeason && detectedSeason > currentSeason && episodesProcessedInCurrentSeason > 0)
+                    if (detectedSeason != currentSeasonNumber)
                     {
-                        Console.WriteLine($"\n🎬 Staffel {currentSeason} abgeschlossen! ({episodesProcessedInCurrentSeason} Episoden verarbeitet)");
-                        FinalizeBatchFile();
+                        // Neue Staffel erkannt
+                        Console.WriteLine($"\n🎬 Staffel {currentSeasonNumber} → Staffel {detectedSeason}");
 
-                        // Frage User, ob weiter mit nächster Staffel
-                        Console.WriteLine($"\n❓ Soll Staffel {detectedSeason} verarbeitet werden? (j/n): ");
-                        var userChoice = Console.ReadKey().KeyChar;
+                        // Frage User ob weitermachen
+                        Console.WriteLine($"❓ Soll Staffel {detectedSeason} verarbeitet werden? (j/n): ");
+                        var choice = Console.ReadKey().KeyChar;
                         Console.WriteLine();
 
-                        if (userChoice == 'j' || userChoice == 'J' || userChoice == 'y' || userChoice == 'Y')
+                        if (choice == 'j' || choice == 'J' || choice == 'y' || choice == 'Y')
                         {
-                            currentSeason = detectedSeason;
-                            episodeCounter = 1;
-                            episodesProcessedInCurrentSeason = 0;
-
-                            // Neue Batch-Datei für neue Staffel
-                            batchFilePath = $"yt-dlp_downloads_S{currentSeason}.bat";
-                            seasonBatches.Add(batchFilePath);
-                            InitializeYtDlpBatchFile();
-
-                            Console.WriteLine($"🚀 Starte Verarbeitung von Staffel {currentSeason}...");
+                            currentSeasonNumber = detectedSeason;
+                            currentEpisodeNumber = detectedEpisode;
+                            currentSeasonObj = GetOrCreateSeason(currentSeasonNumber);
+                            Console.WriteLine($"🚀 Starte Staffel {currentSeasonNumber}");
                         }
                         else
                         {
@@ -337,1185 +206,524 @@ namespace M3U8Extractor
                             break;
                         }
                     }
-                    // Falls erkannte Staffel niedriger ist, aktualisiere nur currentSeason (ohne Neustart)
-                    else if (detectedSeason != currentSeason)
+
+                    // Korrigiere Episode-Nummer falls nötig
+                    if (detectedEpisode > 0 && detectedEpisode != currentEpisodeNumber)
                     {
-                        Console.WriteLine($"🔄 Staffel-Korrektur: {currentSeason} → {detectedSeason}");
-                        currentSeason = detectedSeason;
+                        currentEpisodeNumber = detectedEpisode;
                     }
 
-                    // Stream-Links suchen und anklicken
-                    bool streamFound = await TryActivateStreams();
+                    // Erstelle/Update Episode in Collection
+                    currentEpisodeObj = GetOrCreateEpisode(currentSeasonObj, currentEpisodeNumber);
+                    currentEpisodeObj.UpdateStatus(EpisodeStatus.Processing);
 
-                    if (!streamFound)
+                    Console.WriteLine($"\n📺 Verarbeite Staffel {currentSeasonNumber}, Episode {currentEpisodeNumber}...");
+                    PrintLiveStats();
+
+                    // Versuche M3U8 URL zu finden
+                    bool success = await ProcessCurrentEpisode();
+
+                    if (success)
                     {
-                        LogError($"Keine Stream-Links auf Staffel {currentSeason}, Episode {episodeCounter} gefunden");
-                        consecutiveErrors++;
+                        currentEpisodeObj.UpdateStatus(EpisodeStatus.Found);
+                        consecutiveErrors = 0;
+                        Console.WriteLine($"✅ Episode {currentEpisodeNumber} erfolgreich!");
                     }
                     else
                     {
-                        consecutiveErrors = 0; // Reset bei Erfolg
-
-                        // Prüfe ob M3U8 URLs gefunden wurden
-                        if (capturedUrls.Count > episodesProcessedInCurrentSeason)
-                        {
-                            episodesProcessedInCurrentSeason++;
-                            Console.WriteLine($"✅ Episode {episodeCounter} erfolgreich verarbeitet! (Gesamt in Staffel {currentSeason}: {episodesProcessedInCurrentSeason})");
-                        }
+                        currentEpisodeObj.UpdateStatus(EpisodeStatus.Error, "Keine M3U8 URL gefunden");
+                        consecutiveErrors++;
+                        LogError($"Episode {currentEpisodeNumber} fehlgeschlagen");
                     }
 
-                    // Warte und prüfe auf M3U8 URLs (länger warten)
-                    Thread.Sleep(10000); // 10 Sekunden statt 5
-                    CheckForNewM3U8URLs();
-
-                    // Zusätzliche Prüfung nach weiteren 5 Sekunden
-                    Thread.Sleep(5000);
-                    CheckForNewM3U8URLs();
-
-                    // Versuche zur nächsten Episode zu navigieren
-                    bool nextEpisodeExists = await NavigateToNextEpisode();
-
-                    if (!nextEpisodeExists)
+                    // Navigiere zur nächsten Episode
+                    bool hasNext = await NavigateToNextEpisode();
+                    if (!hasNext)
                     {
-                        Console.WriteLine($"🔍 Keine weitere Episode in Staffel {currentSeason} gefunden");
-                        Console.WriteLine($"📊 Staffel {currentSeason} Statistik: {episodesProcessedInCurrentSeason} Episoden verarbeitet");
+                        Console.WriteLine($"🔍 Keine weitere Episode gefunden");
 
-                        // Nur zur nächsten Staffel wenn wir mindestens eine Episode verarbeitet haben
-                        if (episodesProcessedInCurrentSeason > 0)
+                        // Versuche nächste Staffel
+                        bool hasNextSeason = await TryNavigateToNextSeason(currentSeasonNumber);
+                        if (!hasNextSeason)
                         {
-                            // Prüfe ob es noch weitere Staffeln gibt
-                            bool nextSeasonExists = await TryNavigateToNextSeason();
-
-                            if (!nextSeasonExists)
-                            {
-                                Console.WriteLine("🏁 Keine weiteren Staffeln verfügbar - Scraping beendet");
-                                break;
-                            }
-                            else
-                            {
-                                episodeCounter = 0; // Reset für neue Staffel (wird unten inkrementiert)
-                                episodesProcessedInCurrentSeason = 0; // Reset für neue Staffel
-                            }
+                            Console.WriteLine("🏁 Keine weiteren Staffeln - Extraktion beendet");
+                            break;
                         }
                         else
                         {
-                            Console.WriteLine("❌ Keine Episoden in dieser Staffel verarbeitet - beende Scraping");
-                            break;
+                            continue; // URL wird im nächsten Loop aktualisiert
                         }
                     }
 
-                    episodeCounter++;
+                    currentEpisodeNumber++;
 
                     // Kurze Pause zwischen Episoden
-                    Thread.Sleep(3000);
+                    await Task.Delay(300); // OPTIMIERT: 0.3s statt 0.5s
 
-                    // Bei zu vielen aufeinanderfolgenden Fehlern abbrechen
-                    if (consecutiveErrors >= 2)
-                    {
-                        LogError("Zu viele aufeinanderfolgende Fehler");
-                        break;
-                    }
+                    // Update Statistics
+                    currentSeasonObj.NotifyStatsChanged();
+                    currentSeries.NotifyStatsChanged();
                 }
                 catch (Exception ex)
                 {
-                    LogError($"Fehler bei Staffel {currentSeason}, Episode {episodeCounter}: {ex.Message}");
+                    LogError($"Fehler bei Episode {currentEpisodeNumber}: {ex.Message}");
+                    currentEpisodeObj?.UpdateStatus(EpisodeStatus.Error, ex.Message);
                     consecutiveErrors++;
-
-                    // Bei wiederholten Fehlern längere Pause
-                    Thread.Sleep(5000);
+                    await Task.Delay(2000);
                 }
+            }
+
+            currentSeries.CompletedAt = DateTime.Now;
+            Console.WriteLine($"\n🎉 Extraktion abgeschlossen!");
+        }
+
+        private static async Task<bool> ProcessCurrentEpisode()
+        {
+            await WaitForPageLoad();
+
+            // Versuche Stream-Links zu aktivieren
+            bool streamFound = await TryActivateStreams();
+            if (!streamFound)
+            {
+                Console.WriteLine("❌ Keine Stream-Links gefunden");
+                return false;
+            }
+
+            // Prüfe auf M3U8 URLs (erste Prüfung)
+            await Task.Delay(1500); // OPTIMIERT: 1.5s statt 2s
+            var foundUrls = CheckForM3U8URLs();
+
+            Console.WriteLine($"🔍 Erste M3U8 Prüfung: {foundUrls.Count} URLs gefunden");
+
+            if (foundUrls.Count == 0)
+            {
+                // Zweiter Versuch nach kurzer Wartezeit
+                Console.WriteLine("🔄 Zweite M3U8 Prüfung...");
+                await Task.Delay(1000); // OPTIMIERT: 1s statt 1.5s
+                foundUrls = CheckForM3U8URLs();
+                Console.WriteLine($"🔍 Zweite M3U8 Prüfung: {foundUrls.Count} URLs gefunden");
+            }
+
+            if (foundUrls.Count > 0)
+            {
+                // Debug: Zeige alle gefundenen URLs
+                Console.WriteLine($"📋 Gefundene M3U8 URLs:");
+                foreach (var url in foundUrls)
+                {
+                    Console.WriteLine($"   🔗 {url.Substring(0, Math.Min(80, url.Length))}...");
+                }
+
+                // Beste URL auswählen (bevorzuge master.m3u8)
+                var masterUrls = foundUrls.Where(url => url.Contains("master.m3u8")).ToList();
+                var bestUrl = masterUrls.FirstOrDefault() ?? foundUrls[0];
+
+                if (masterUrls.Count > 0)
+                {
+                    Console.WriteLine($"🎯 Master.m3u8 URL gewählt");
+                }
+                else
+                {
+                    Console.WriteLine($"⚠️  Keine master.m3u8 gefunden - nehme erste verfügbare URL");
+                }
+
+                currentEpisodeObj.M3U8Url = bestUrl;
+                currentEpisodeObj.Title = GetEpisodeTitle();
+
+                Console.WriteLine($"✅ M3U8 URL gespeichert: {bestUrl.Substring(0, Math.Min(60, bestUrl.Length))}...");
+                return true;
+            }
+            else
+            {
+                Console.WriteLine("❌ Keine M3U8 URLs gefunden");
+                return false;
             }
         }
 
         private static async Task<bool> TryActivateStreams()
         {
-            bool streamFound = false;
-            int maxAttempts = 7;
-            int attempt = 0;
-
-            // Verschiedene Selektoren für serienstream.to-ähnliche Seiten
             var streamSelectors = new[]
             {
-                ".watchEpisode",                    // Haupt-Stream-Link
-                ".hosterSiteVideoButton",          // Stream-Button
-                ".generateInlinePlayer a",         // Inline-Player Link
-                "a[href*='redirect']",             // Redirect-Links
-                "li[data-link-target] a",          // Stream-Hoster Links
-                ".episodeLink a"                   // Alternative Episode-Links
+                ".watchEpisode",
+                ".hosterSiteVideoButton",
+                ".generateInlinePlayer a",
+                "a[href*='redirect']",
+                "li[data-link-target] a"
             };
 
-            while (attempt < maxAttempts)
+            foreach (var selector in streamSelectors)
             {
-                attempt++;
-                Console.WriteLine($"🔄 Versuch {attempt}/{maxAttempts} - Suche nach Stream-Links...");
-
-                foreach (var selector in streamSelectors)
+                try
                 {
-                    try
+                    var elements = driver.FindElements(By.CssSelector(selector));
+                    if (elements.Count > 0)
                     {
-                        var elements = driver.FindElements(By.CssSelector(selector));
-                        Console.WriteLine($"🔍 Gefunden {elements.Count} Elemente für Selektor: {selector}");
+                        Console.WriteLine($"🔍 {elements.Count} Stream-Links gefunden ({selector})");
 
-                        if (elements.Count > 0)
+                        // Klicke auf ersten Link
+                        ((IJavaScriptExecutor)driver).ExecuteScript("arguments[0].click();", elements[0]);
+                        await Task.Delay(1500);
+
+                        // Versuche Redirect zu folgen
+                        bool success = await FollowRedirectsToVideoPage();
+                        if (success)
                         {
-                            // Klicke auf die ersten paar Elemente (verschiedene Hoster)
-                            int maxClicks = Math.Min(elements.Count, 3);
-
-                            for (int i = 0; i < maxClicks; i++)
-                            {
-                                try
-                                {
-                                    var element = elements[i];
-
-                                    // JavaScript-Click für bessere Kompatibilität
-                                    ((IJavaScriptExecutor)driver).ExecuteScript("arguments[0].click();", element);
-                                    Console.WriteLine($"🖱️  Versuch {attempt}: Link {i + 1} angeklickt");
-
-                                    streamFound = true;
-                                    Thread.Sleep(3000); // 3 Sekunden warten
-
-                                    // === NEUE METHODE: REDIRECT-URLs DIREKT FOLGEN ===
-                                    bool m3u8Found = await FollowRedirectsToVideoPages();
-
-                                    if (m3u8Found && capturedUrls.Count > 0)
-                                    {
-                                        Console.WriteLine($"✅ M3U8 URL über redirect gefunden! Fahre mit nächster Episode fort.");
-                                        return true;
-                                    }
-
-                                }
-                                catch (Exception ex)
-                                {
-                                    Console.WriteLine($"⚠️  Fehler beim Klicken auf Element {i + 1}: {ex.Message}");
-                                }
-                            }
+                            return true;
                         }
                     }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"⚠️  Selektor {selector} nicht verfügbar: {ex.Message}");
-                    }
                 }
-
-                // Warte 3 Sekunden vor dem nächsten Versuch (außer beim letzten Versuch)
-                if (attempt < maxAttempts)
+                catch (Exception ex)
                 {
-                    Console.WriteLine($"⏳ Warte 3 Sekunden vor Versuch {attempt + 1}...");
-                    Thread.Sleep(3000);
-                }
-
-                // Prüfe nochmal auf M3U8 URLs am Ende jedes Versuchs
-                CheckForNewM3U8URLs();
-                if (capturedUrls.Count > 0)
-                {
-                    Console.WriteLine($"✅ M3U8 URL gefunden nach Versuch {attempt}!");
-                    return true;
+                    Console.WriteLine($"⚠️  Stream-Aktivierung Fehler: {ex.Message}");
                 }
             }
 
-            if (capturedUrls.Count == 0)
-            {
-                Console.WriteLine($"❌ Keine M3U8 URL nach {maxAttempts} Versuchen gefunden");
-                Console.WriteLine($"🛑 KRITISCHER FEHLER: Maximale Versuche erreicht - Prozess wird abgebrochen!");
-
-                // Setze Error-Counter auf Maximum um gesamten Prozess zu beenden
-                errorCount = maxErrors;
-                return false;
-            }
-
-            return streamFound;
+            return false;
         }
 
-        private static async Task<bool> FollowRedirectsToVideoPages()
+        private static async Task<bool> FollowRedirectsToVideoPage()
         {
-            Console.WriteLine("🔗 Suche nach redirect-URLs...");
-            var originalUrl = driver.Url; // Merke dir die ursprüngliche URL
+            var originalUrl = driver.Url;
+            var foundVideoUrls = new List<string>(); // WICHTIG: Sammle URLs bevor wir zurücknavigieren
 
             try
             {
-                // Warte auf iframes mit redirect-URLs
-                Thread.Sleep(5000);
+                await Task.Delay(1500); // OPTIMIERT: 1.5s statt 2s
 
                 var iframes = driver.FindElements(By.TagName("iframe"));
-                Console.WriteLine($"🖼️  {iframes.Count} iframe(s) gefunden");
-
                 foreach (var iframe in iframes)
                 {
-                    try
+                    var src = iframe.GetAttribute("src");
+                    if (!string.IsNullOrEmpty(src) && (src.Contains("redirect") || src.Contains("/redirect/")))
                     {
-                        var src = iframe.GetAttribute("src");
-                        if (!string.IsNullOrEmpty(src))
+                        Console.WriteLine($"🔗 Folge Redirect: {src}");
+
+                        string fullUrl = src.StartsWith("/")
+                            ? $"{new Uri(driver.Url).Scheme}://{new Uri(driver.Url).Host}{src}"
+                            : src;
+
+                        driver.Navigate().GoToUrl(fullUrl);
+                        await WaitForPageLoad();
+                        await Task.Delay(1500); // OPTIMIERT: 1.5s statt 2s
+
+                        SetupVideoPageNetworkMonitoring();
+
+                        // Versuche Play-Buttons und sammle URLs
+                        bool buttonSuccess = await TryPlayButtonsOnVideoPage();
+
+                        // WICHTIG: Sammle URLs BEVOR wir zurücknavigieren
+                        var videoPageUrls = CheckForM3U8URLs();
+                        foreach (var url in videoPageUrls)
                         {
-                            Console.WriteLine($"🔗 Iframe src: {src}");
-
-                            // Prüfe ob es ein redirect-Link ist
-                            if (src.Contains("redirect") || src.Contains("/redirect/"))
+                            if (!foundVideoUrls.Contains(url))
                             {
-                                Console.WriteLine($"🎯 Redirect-URL gefunden: {src}");
-
-                                // Baue vollständige URL wenn nötig
-                                string fullUrl = src;
-                                if (src.StartsWith("/"))
-                                {
-                                    var baseUri = new Uri(driver.Url);
-                                    fullUrl = $"{baseUri.Scheme}://{baseUri.Host}{src}";
-                                }
-
-                                Console.WriteLine($"🌐 Navigiere zu Video-Seite: {fullUrl}");
-
-                                // Öffne die Video-Seite direkt
-                                driver.Navigate().GoToUrl(fullUrl);
-
-                                // Warte bis Video-Seite geladen ist
-                                await WaitForPageLoad();
-                                Thread.Sleep(5000); // Grundwartezeit für Video-Seite
-
-                                Console.WriteLine($"📺 Video-Seite geladen: {driver.Url}");
-
-                                // Setup Monitoring auf Video-Seite
-                                SetupVideoPageNetworkMonitoring();
-
-                                // === NEUE LOGIK: PLAY-BUTTON AUF VIDEO-SEITE DRÜCKEN ===
-                                bool m3u8Found = await TryPlayButtonsOnVideoPage();
-
-                                if (m3u8Found && capturedUrls.Count > 0)
-                                {
-                                    Console.WriteLine($"✅ M3U8 URL auf Video-Seite gefunden!");
-
-                                    // Zurück zur ursprünglichen Seite
-                                    driver.Navigate().GoToUrl(originalUrl);
-                                    await WaitForPageLoad();
-
-                                    return true;
-                                }
-
-                                Console.WriteLine($"❌ Keine M3U8 auf Video-Seite gefunden: {driver.Url}");
+                                foundVideoUrls.Add(url);
+                                Console.WriteLine($"💾 URL aus Video-Seite gespeichert: {url.Substring(0, Math.Min(60, url.Length))}...");
                             }
                         }
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"⚠️  Fehler beim redirect-Follow: {ex.Message}");
+
+                        // Zurück zur ursprünglichen Seite
+                        driver.Navigate().GoToUrl(originalUrl);
+                        await WaitForPageLoad();
+
+                        // WICHTIG: Füge URLs zur globalen Liste hinzu (für CheckForM3U8URLs später)
+                        if (foundVideoUrls.Count > 0)
+                        {
+                            var addUrlsScript = "window.foundM3U8URLs = window.foundM3U8URLs || []; ";
+                            foreach (var url in foundVideoUrls)
+                            {
+                                addUrlsScript += $"window.foundM3U8URLs.push('{url}'); ";
+                            }
+                            ((IJavaScriptExecutor)driver).ExecuteScript(addUrlsScript);
+
+                            Console.WriteLine($"✅ {foundVideoUrls.Count} M3U8 URLs zur Hauptseite transferiert");
+                            return true;
+                        }
                     }
                 }
 
-                // Zurück zur ursprünglichen Seite
-                if (driver.Url != originalUrl)
+                return foundVideoUrls.Count > 0;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"⚠️  Redirect-Fehler: {ex.Message}");
+                try
                 {
                     driver.Navigate().GoToUrl(originalUrl);
                     await WaitForPageLoad();
                 }
-
-                return false;
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"⚠️  Fehler bei redirect-Verfolgung: {ex.Message}");
-
-                // Sicherheit: Zurück zur ursprünglichen Seite
-                try
-                {
-                    if (driver.Url != originalUrl)
-                    {
-                        driver.Navigate().GoToUrl(originalUrl);
-                        await WaitForPageLoad();
-                    }
-                }
                 catch { }
-
-                return false;
+                return foundVideoUrls.Count > 0;
             }
         }
 
         private static async Task<bool> TryPlayButtonsOnVideoPage()
         {
-            Console.WriteLine("🎮 Suche nach Play-Buttons auf Video-Seite...");
-
-            int maxAttempts = 7;
-
-            // Verschiedene Play-Button Selektoren für Video-Player
             var playButtonSelectors = new[]
             {
-                ".vjs-big-play-button",          // Video.js Player
-                ".jw-display-icon-container",    // JW Player
-                ".plyr__controls button[data-plyr='play']", // Plyr Player
-                "button[aria-label*='play']",    // Accessibility Play Button
-                ".play-button",                  // Generic Play Button
-                ".video-play-button",            // Video Play Button
-                "[class*='play']",               // Allgemeine Play-Klassen
-                "button[title*='play']",         // Play Button mit Title
-                ".player-play-button",           // Player-spezifische Buttons
-                "video",                         // Direktes Video-Element
-                "[onclick*='play']",             // JavaScript Play Handler
-                ".btn-play",                     // Bootstrap Play Button
-                ".fa-play",                      // FontAwesome Play Icon
-                "[data-action='play']"           // Data-Action Play
+                ".vjs-big-play-button",
+                ".jw-display-icon-container",
+                "button[aria-label*='play']",
+                ".play-button",
+                "video"
             };
 
-            for (int attempt = 1; attempt <= maxAttempts; attempt++)
+            foreach (var selector in playButtonSelectors)
             {
-                Console.WriteLine($"🎮 Video-Seite Versuch {attempt}/{maxAttempts} - Suche Play-Buttons...");
-
-                foreach (var selector in playButtonSelectors)
-                {
-                    try
-                    {
-                        var elements = driver.FindElements(By.CssSelector(selector));
-
-                        if (elements.Count > 0)
-                        {
-                            Console.WriteLine($"🎯 {elements.Count} Play-Element(e) für '{selector}' gefunden");
-
-                            // Versuche mit den ersten paar Elementen
-                            int maxClicks = Math.Min(elements.Count, 2);
-
-                            for (int i = 0; i < maxClicks; i++)
-                            {
-                                try
-                                {
-                                    var element = elements[i];
-
-                                    // Prüfe ob Element sichtbar/klickbar ist
-                                    if (element.Displayed && element.Enabled)
-                                    {
-                                        Console.WriteLine($"🖱️  Video-Seite Versuch {attempt}: Play-Button {i + 1} klicken");
-
-                                        // JavaScript-Click für bessere Kompatibilität
-                                        ((IJavaScriptExecutor)driver).ExecuteScript("arguments[0].click();", element);
-
-                                        // Warte 3 Sekunden nach Klick
-                                        Thread.Sleep(3000);
-
-                                        // Prüfe sofort auf M3U8 URLs
-                                        await CheckForM3U8OnVideoPage();
-
-                                        if (capturedUrls.Count > 0)
-                                        {
-                                            Console.WriteLine($"✅ M3U8 URL nach Play-Button Klick gefunden!");
-                                            return true;
-                                        }
-                                    }
-                                }
-                                catch (Exception ex)
-                                {
-                                    Console.WriteLine($"⚠️  Fehler beim Play-Button Klick: {ex.Message}");
-                                }
-                            }
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"⚠️  Play-Button Selektor '{selector}' nicht verfügbar: {ex.Message}");
-                    }
-                }
-
-                // Zusätzlich: Versuche auch Klick auf das Video-Element selbst
                 try
                 {
-                    var videoElements = driver.FindElements(By.TagName("video"));
-                    if (videoElements.Count > 0)
+                    var elements = driver.FindElements(By.CssSelector(selector));
+                    if (elements.Count > 0)
                     {
-                        Console.WriteLine($"📹 {videoElements.Count} Video-Element(e) gefunden - versuche direkten Klick");
-
-                        foreach (var video in videoElements.Take(2))
+                        var element = elements[0];
+                        if (element.Displayed && element.Enabled)
                         {
-                            try
+                            Console.WriteLine($"🎮 Klicke Play-Button: {selector}");
+                            ((IJavaScriptExecutor)driver).ExecuteScript("arguments[0].click();", element);
+                            await Task.Delay(1000); // OPTIMIERT: 1s statt 1.5s
+
+                            var urls = CheckForM3U8URLs();
+                            if (urls.Count > 0)
                             {
-                                ((IJavaScriptExecutor)driver).ExecuteScript("arguments[0].play();", video);
-                                ((IJavaScriptExecutor)driver).ExecuteScript("arguments[0].click();", video);
-                                Console.WriteLine($"🎬 Video-Element direkt aktiviert");
-
-                                Thread.Sleep(3000);
-                                await CheckForM3U8OnVideoPage();
-
-                                if (capturedUrls.Count > 0)
+                                Console.WriteLine($"✅ M3U8 auf Video-Seite gefunden: {urls.Count} URLs");
+                                foreach (var url in urls)
                                 {
-                                    Console.WriteLine($"✅ M3U8 URL nach Video-Element Aktivierung gefunden!");
-                                    return true;
+                                    Console.WriteLine($"   🔗 {url.Substring(0, Math.Min(60, url.Length))}...");
                                 }
-                            }
-                            catch (Exception ex)
-                            {
-                                Console.WriteLine($"⚠️  Fehler bei Video-Element Aktivierung: {ex.Message}");
+                                return true;
                             }
                         }
                     }
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"⚠️  Fehler bei Video-Element Suche: {ex.Message}");
-                }
-
-                // Warte zwischen den Versuchen (außer beim letzten)
-                if (attempt < maxAttempts)
-                {
-                    Console.WriteLine($"⏳ Video-Seite: Warte 3 Sekunden vor Versuch {attempt + 1}...");
-                    Thread.Sleep(3000);
-
-                    // Prüfe nochmal auf M3U8 URLs (falls sie durch Werbung verzögert geladen werden)
-                    await CheckForM3U8OnVideoPage();
-                    if (capturedUrls.Count > 0)
-                    {
-                        Console.WriteLine($"✅ M3U8 URL nach Wartezeit gefunden!");
-                        return true;
-                    }
+                    Console.WriteLine($"⚠️  Play-Button Fehler: {ex.Message}");
                 }
             }
 
-            Console.WriteLine($"❌ Keine M3U8 URLs nach {maxAttempts} Play-Versuchen auf Video-Seite gefunden");
             return false;
         }
 
-        private static void SetupVideoPageNetworkMonitoring()
+        private static List<string> CheckForM3U8URLs()
         {
-            // Spezielles Monitoring für Video-Seiten
-            var script = @"
-                window.foundM3U8URLs = window.foundM3U8URLs || [];
-                
-                console.log('Setting up video page monitoring...');
-                
-                // Override fetch
-                const originalFetch = window.fetch;
-                if (originalFetch) {
-                    window.fetch = function(...args) {
-                        const url = args[0];
-                        if (typeof url === 'string') {
-                            console.log('VIDEO PAGE FETCH:', url);
-                            if (url.includes('.m3u8') || url.includes('master.m3u8') || url.includes('playlist.m3u8') || url.includes('index.m3u8') || url.includes('.ts')) {
-                                window.foundM3U8URLs.push(url);
-                                console.log('*** M3U8/TS URL FOUND on video page:', url);
-                            }
-                        }
-                        return originalFetch.apply(this, args);
-                    };
-                }
-                
-                // Override XMLHttpRequest
-                const originalOpen = XMLHttpRequest.prototype.open;
-                XMLHttpRequest.prototype.open = function(method, url, ...args) {
-                    if (typeof url === 'string') {
-                        console.log('VIDEO PAGE XHR:', url);
-                        if (url.includes('.m3u8') || url.includes('master.m3u8') || url.includes('playlist.m3u8') || url.includes('index.m3u8') || url.includes('.ts')) {
-                            window.foundM3U8URLs.push(url);
-                            console.log('*** M3U8/TS URL FOUND on video page:', url);
-                        }
-                    }
-                    return originalOpen.apply(this, [method, url, ...args]);
-                };
-                
-                console.log('*** Video page network monitoring activated ***');
-            ";
+            var foundUrls = new List<string>();
 
-            ((IJavaScriptExecutor)driver).ExecuteScript(script);
-            Console.WriteLine("📡 Video-Seiten Netzwerk-Monitoring aktiviert");
-        }
-
-        private static async Task CheckForM3U8OnVideoPage()
-        {
             try
             {
-                var episodeM3U8Found = false; // Flag um nur eine M3U8 pro Episode zu nehmen
+                // JavaScript URLs prüfen
+                var jsUrls = ((IJavaScriptExecutor)driver).ExecuteScript("return window.foundM3U8URLs || [];")
+                    as System.Collections.ObjectModel.ReadOnlyCollection<object>;
 
-                // Prüfe auf M3U8 URLs im JavaScript
-                var foundUrls = ((IJavaScriptExecutor)driver).ExecuteScript("return window.foundM3U8URLs || [];") as System.Collections.ObjectModel.ReadOnlyCollection<object>;
-
-                if (foundUrls != null)
+                if (jsUrls != null)
                 {
-                    foreach (var urlObj in foundUrls)
+                    foreach (var urlObj in jsUrls)
                     {
                         var url = urlObj?.ToString();
-                        if (!string.IsNullOrEmpty(url) && !capturedUrls.Contains(url))
+                        if (IsValidM3U8Url(url))
                         {
-                            // Filtere nur echte M3U8 URLs (nicht .ts segments oder Tracking)
-                            if (IsValidM3U8Url(url))
-                            {
-                                // Priorisiere master.m3u8 über andere
-                                if (url.Contains("master.m3u8") || !episodeM3U8Found)
-                                {
-                                    capturedUrls.Add(url);
-                                    Console.WriteLine($"✅ M3U8 URL auf Video-Seite gefunden: {url}");
-                                    AddToYtDlpBatch(url);
-                                    episodeM3U8Found = true;
+                            foundUrls.Add(url);
+                        }
+                    }
+                }
 
-                                    // Bei master.m3u8 können wir aufhören
-                                    if (url.Contains("master.m3u8"))
-                                    {
-                                        Console.WriteLine("🎯 Master.m3u8 gefunden - beste Qualität gewählt");
-                                        break;
-                                    }
-                                }
+                // Performance API als Backup
+                var script = @"
+                    try {
+                        var entries = performance.getEntriesByType('resource');
+                        var m3u8Urls = [];
+                        entries.forEach(function(entry) {
+                            if (entry.name.includes('.m3u8') && !entry.name.includes('.ts')) {
+                                m3u8Urls.push(entry.name);
                             }
-                        }
+                        });
+                        return m3u8Urls;
+                    } catch(e) {
+                        return [];
                     }
-                }
+                ";
 
-                // Performance API als Backup (nur wenn noch nichts gefunden)
-                if (!episodeM3U8Found)
+                var performanceUrls = ((IJavaScriptExecutor)driver).ExecuteScript(script)
+                    as System.Collections.ObjectModel.ReadOnlyCollection<object>;
+
+                if (performanceUrls != null)
                 {
-                    var script = @"
-                        try {
-                            var entries = performance.getEntriesByType('resource');
-                            var m3u8Urls = [];
-                            entries.forEach(function(entry) {
-                                if (entry.name.includes('.m3u8') && !entry.name.includes('.ts')) {
-                                    m3u8Urls.push(entry.name);
-                                }
-                            });
-                            return m3u8Urls;
-                        } catch(e) {
-                            return [];
-                        }
-                    ";
-
-                    var performanceUrls = ((IJavaScriptExecutor)driver).ExecuteScript(script) as System.Collections.ObjectModel.ReadOnlyCollection<object>;
-
-                    if (performanceUrls != null)
+                    foreach (var urlObj in performanceUrls)
                     {
-                        foreach (var urlObj in performanceUrls)
+                        var url = urlObj?.ToString();
+                        if (IsValidM3U8Url(url) && !foundUrls.Contains(url))
                         {
-                            var url = urlObj?.ToString();
-                            if (!string.IsNullOrEmpty(url) && !capturedUrls.Contains(url) && IsValidM3U8Url(url))
-                            {
-                                capturedUrls.Add(url);
-                                Console.WriteLine($"✅ M3U8 URL über Performance API auf Video-Seite gefunden: {url}");
-                                AddToYtDlpBatch(url);
-                                break; // Nur eine URL pro Episode
-                            }
+                            foundUrls.Add(url);
                         }
                     }
                 }
+
+                // Reset Browser URLs
+                ((IJavaScriptExecutor)driver).ExecuteScript("window.foundM3U8URLs = [];");
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"⚠️  Fehler beim M3U8-Check auf Video-Seite: {ex.Message}");
+                Console.WriteLine($"⚠️  M3U8 Check Fehler: {ex.Message}");
             }
+
+            return foundUrls;
         }
 
-        private static bool IsValidM3U8Url(string url)
+        // Collection Management
+        private static Season GetOrCreateSeason(int seasonNumber)
         {
-            if (string.IsNullOrEmpty(url)) return false;
-
-            // Muss .m3u8 enthalten
-            if (!url.Contains(".m3u8")) return false;
-
-            // Filtere Tracking/Analytics URLs aus
-            if (url.Contains("jwplayer") && url.Contains(".gif")) return false;
-            if (url.Contains("analytics")) return false;
-            if (url.Contains("tracking")) return false;
-            if (url.Contains("stats")) return false;
-
-            // Muss eine gültige HTTP(S) URL sein
-            if (!url.StartsWith("http://") && !url.StartsWith("https://")) return false;
-
-            Console.WriteLine($"🔍 Validiere M3U8 URL: {url}");
-            return true;
+            var season = currentSeries.Seasons.FirstOrDefault(s => s.Number == seasonNumber);
+            if (season == null)
+            {
+                season = new Season { Number = seasonNumber };
+                currentSeries.Seasons.Add(season);
+                Console.WriteLine($"📁 Neue Staffel erstellt: {seasonNumber}");
+            }
+            return season;
         }
 
-        private static async Task<bool> WaitForPageLoad()
+        private static Episode GetOrCreateEpisode(Season season, int episodeNumber)
+        {
+            var episode = season.Episodes.FirstOrDefault(e => e.Number == episodeNumber);
+            if (episode == null)
+            {
+                episode = new Episode { Number = episodeNumber };
+                season.Episodes.Add(episode);
+            }
+            return episode;
+        }
+
+        // Export Functions
+        private static async Task ExportResults()
         {
             try
             {
-                var wait = new WebDriverWait(driver, TimeSpan.FromSeconds(15));
-                wait.Until(driver => ((IJavaScriptExecutor)driver)
-                    .ExecuteScript("return document.readyState").Equals("complete"));
+                // JSON Export
+                await ExportToJson();
 
-                Thread.Sleep(3000); // Zusätzliche Wartezeit für dynamischen Inhalt
-                return true;
+                // Batch Export (für yt-dlp)
+                await ExportToBatch();
+
+                // CSV Export
+                await ExportToCsv();
+
+                Console.WriteLine("📄 Alle Export-Dateien erstellt!");
             }
             catch (Exception ex)
             {
-                LogError($"Timeout beim Laden der Seite: {ex.Message}");
-                return false;
+                Console.WriteLine($"⚠️  Export-Fehler: {ex.Message}");
             }
         }
 
-        private static async Task HandleNewWindows()
+        private static async Task ExportToJson()
         {
-            try
+            var jsonOptions = new JsonSerializerOptions { WriteIndented = true };
+            var json = JsonSerializer.Serialize(currentSeries, jsonOptions);
+
+            var fileName = $"{currentSeries.CleanName}_extraction.json";
+            await File.WriteAllTextAsync(fileName, json);
+            Console.WriteLine($"💾 JSON Export: {fileName}");
+        }
+
+        private static async Task ExportToBatch()
+        {
+            foreach (var season in currentSeries.Seasons)
             {
-                if (driver.WindowHandles.Count > 1)
-                {
-                    // Zu neuem Fenster wechseln
-                    driver.SwitchTo().Window(driver.WindowHandles[^1]);
-                    var currentUrl = driver.Url;
-                    Console.WriteLine($"📱 Neues Fenster: {currentUrl}");
+                var foundEpisodes = season.Episodes.Where(e => e.Status == EpisodeStatus.Found).ToList();
+                if (foundEpisodes.Count == 0) continue;
 
-                    // Längere Wartezeit für Stream-Loading
-                    Thread.Sleep(5000);
+                var fileName = $"{currentSeries.CleanName}_S{season.Number:D2}_yt-dlp.bat";
+                var batchContent = GenerateBatchContent(season, foundEpisodes);
 
-                    // Setup Monitoring im neuen Fenster
-                    SetupNetworkMonitoring();
-
-                    // Warte auf Stream-Loading (bis zu 15 Sekunden)
-                    for (int i = 0; i < 5; i++)
-                    {
-                        Thread.Sleep(3000);
-                        CheckForNewM3U8URLs();
-
-                        // Prüfe auch direkt nach iframes im neuen Fenster
-                        try
-                        {
-                            var iframes = driver.FindElements(By.TagName("iframe"));
-                            foreach (var iframe in iframes)
-                            {
-                                var src = iframe.GetAttribute("src");
-                                if (!string.IsNullOrEmpty(src))
-                                {
-                                    Console.WriteLine($"🖼️  Iframe gefunden: {src}");
-
-                                    // Prüfe iframe src auf stream-Hinweise
-                                    if (src.Contains("player") || src.Contains("embed") || src.Contains("stream"))
-                                    {
-                                        Console.WriteLine($"🎬 Stream-iframe erkannt: {src}");
-                                    }
-                                }
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            Console.WriteLine($"⚠️  Fehler beim iframe-Check: {ex.Message}");
-                        }
-
-                        // Früher Ausstieg wenn M3U8 gefunden
-                        if (capturedUrls.Count > 0)
-                        {
-                            Console.WriteLine($"✅ M3U8 URL in neuem Fenster gefunden!");
-                            break;
-                        }
-                    }
-
-                    // Schließe das neue Fenster und kehre zum Hauptfenster zurück
-                    driver.Close();
-                    driver.SwitchTo().Window(driver.WindowHandles[0]);
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"⚠️  Fehler beim Behandeln neuer Fenster: {ex.Message}");
-
-                // Sicherheit: Zurück zum ersten Fenster
-                try
-                {
-                    driver.SwitchTo().Window(driver.WindowHandles[0]);
-                }
-                catch { }
+                await File.WriteAllTextAsync(fileName, batchContent);
+                Console.WriteLine($"🎬 Batch Export: {fileName} ({foundEpisodes.Count} Episodes)");
             }
         }
 
-        private static async Task<bool> NavigateToNextEpisode()
+        private static async Task ExportToCsv()
         {
-            try
+            var csv = new List<string> { "Serie,Staffel,Episode,Status,M3U8_URL,Titel,Gefunden_Am" };
+
+            foreach (var season in currentSeries.Seasons)
             {
-                Console.WriteLine("🔍 Suche nach nächster Episode...");
-                var originalUrl = driver.Url; // Merke dir die ursprüngliche URL
-
-                // KORRIGIERT: Spezifischer Selektor NUR für EPISODEN (nicht Staffeln)
-                // Episoden haben data-episode-id Attribut
-                var episodeLinks = driver.FindElements(By.CssSelector("a[data-episode-id]"));
-                Console.WriteLine($"📋 {episodeLinks.Count} Episode-Links gefunden");
-
-                if (episodeLinks.Count > 0)
+                foreach (var episode in season.Episodes)
                 {
-                    // Finde den aktiven Episode-Link
-                    var activeEpisodeLink = episodeLinks.FirstOrDefault(link =>
-                        link.GetAttribute("class")?.Contains("active") == true);
-
-                    if (activeEpisodeLink != null)
-                    {
-                        var activeIndex = episodeLinks.ToList().IndexOf(activeEpisodeLink);
-                        var currentEpisodeId = activeEpisodeLink.GetAttribute("data-episode-id");
-                        var currentEpisodeTitle = activeEpisodeLink.GetAttribute("title");
-
-                        Console.WriteLine($"📍 Aktuelle Episode: {currentEpisodeTitle} (ID: {currentEpisodeId}, Index: {activeIndex})");
-
-                        // Klicke auf den nächsten EPISODE-Link
-                        if (activeIndex + 1 < episodeLinks.Count)
-                        {
-                            var nextEpisodeLink = episodeLinks[activeIndex + 1];
-                            var nextEpisodeId = nextEpisodeLink.GetAttribute("data-episode-id");
-                            var nextEpisodeTitle = nextEpisodeLink.GetAttribute("title");
-                            var expectedUrl = nextEpisodeLink.GetAttribute("href");
-
-                            Console.WriteLine($"➡️  Navigiere zu nächster Episode: {nextEpisodeTitle} (ID: {nextEpisodeId})");
-                            Console.WriteLine($"🎯 Erwartete URL: {expectedUrl}");
-
-                            ((IJavaScriptExecutor)driver).ExecuteScript("arguments[0].click();", nextEpisodeLink);
-
-                            // Warte bis neue Episode geladen ist
-                            await WaitForPageLoad();
-                            Thread.Sleep(3000);
-
-                            // KORRIGIERT: Überprüfe ob Navigation erfolgreich war
-                            var newUrl = driver.Url;
-                            Console.WriteLine($"🔍 Neue URL nach Navigation: {newUrl}");
-
-                            if (newUrl != originalUrl && (newUrl.Contains(expectedUrl) || expectedUrl.Contains(newUrl.Split('?')[0])))
-                            {
-                                Console.WriteLine($"✅ Link-Navigation erfolgreich");
-                                return true;
-                            }
-                            else
-                            {
-                                Console.WriteLine($"⚠️  Link-Navigation fehlgeschlagen (URL nicht geändert oder falsch)");
-                                Console.WriteLine($"   Original: {originalUrl}");
-                                Console.WriteLine($"   Erwartet: {expectedUrl}");
-                                Console.WriteLine($"   Aktuell:  {newUrl}");
-                            }
-                        }
-                        else
-                        {
-                            Console.WriteLine($"🏁 Keine weitere Episode nach {currentEpisodeTitle} in dieser Staffel gefunden");
-                            return false;
-                        }
-                    }
-                    else
-                    {
-                        Console.WriteLine("⚠️  Kein aktiver Episode-Link gefunden - versuche URL-Methode");
-                    }
+                    csv.Add($"{currentSeries.Name},{season.Number},{episode.Number},{episode.Status}," +
+                           $"\"{episode.M3U8Url}\",\"{episode.Title}\",{episode.FoundAt?.ToString("yyyy-MM-dd HH:mm:ss")}");
                 }
-
-                // Methode 2: URL-basierte Navigation (Fallback)
-                Console.WriteLine("🔄 Versuche URL-basierte Navigation...");
-                var currentUrl = driver.Url;
-                var nextUrl = GenerateNextEpisodeUrl(currentUrl);
-
-                if (nextUrl != null && nextUrl != currentUrl)
-                {
-                    Console.WriteLine($"🌐 Navigiere zu: {nextUrl}");
-                    driver.Navigate().GoToUrl(nextUrl);
-                    await WaitForPageLoad();
-
-                    // Prüfe ob Seite existiert (kein 404)
-                    var pageTitle = driver.Title.ToLower();
-                    if (!pageTitle.Contains("404") && !pageTitle.Contains("not found") && !pageTitle.Contains("error"))
-                    {
-                        Console.WriteLine("✅ URL-basierte Navigation erfolgreich");
-                        return true;
-                    }
-                    else
-                    {
-                        Console.WriteLine("❌ Nächste Episode existiert nicht (404/Error) - Ende der Staffel erreicht");
-                        return false;
-                    }
-                }
-
-                Console.WriteLine("❌ Alle Navigationsmethoden fehlgeschlagen - Ende der Staffel");
-                return false;
             }
-            catch (Exception ex)
-            {
-                LogError($"Fehler beim Navigieren zur nächsten Episode: {ex.Message}");
-                return false;
-            }
+
+            var fileName = $"{currentSeries.CleanName}_episodes.csv";
+            await File.WriteAllLinesAsync(fileName, csv);
+            Console.WriteLine($"📊 CSV Export: {fileName}");
         }
 
-        private static int GetSeasonFromCurrentUrl()
+        private static string GenerateBatchContent(Season season, List<Episode> episodes)
         {
-            try
-            {
-                var currentUrl = driver.Url;
-                var uri = new Uri(currentUrl);
-                var segments = uri.Segments;
-
-                for (int i = 0; i < segments.Length; i++)
-                {
-                    if (segments[i].StartsWith("staffel-"))
-                    {
-                        var seasonStr = segments[i].Replace("staffel-", "").TrimEnd('/');
-                        if (int.TryParse(seasonStr, out int season))
-                        {
-                            return season;
-                        }
-                    }
-                }
-
-                return 1; // Fallback
-            }
-            catch
-            {
-                return 1;
-            }
-        }
-
-        private static async Task<bool> TryNavigateToNextSeason()
-        {
-            try
-            {
-                Console.WriteLine($"🔍 Suche nach Staffel {currentSeason + 1}...");
-
-                // KORRIGIERT: Spezifische Suche nach STAFFEL-Links (nicht Episode-Links)
-                // Staffel-Links haben title="Staffel X" und KEINE data-episode-id
-                var seasonLinks = driver.FindElements(By.CssSelector(".hosterSiteDirectNav ul li a[title*='Staffel']:not([data-episode-id])"));
-                Console.WriteLine($"📺 {seasonLinks.Count} Staffel-Links gefunden");
-
-                // Suche nach Link zur nächsten Staffel
-                var nextSeasonNumber = currentSeason + 1;
-                var nextSeasonLink = seasonLinks.FirstOrDefault(link =>
-                    link.GetAttribute("title")?.Contains($"Staffel {nextSeasonNumber}") == true ||
-                    (link.Text.Trim() == nextSeasonNumber.ToString() && link.GetAttribute("title")?.Contains("Staffel") == true));
-
-                if (nextSeasonLink != null)
-                {
-                    var linkTitle = nextSeasonLink.GetAttribute("title");
-                    var linkText = nextSeasonLink.Text.Trim();
-                    Console.WriteLine($"🎬 Staffel-Link gefunden: '{linkTitle}' (Text: '{linkText}')");
-
-                    ((IJavaScriptExecutor)driver).ExecuteScript("arguments[0].click();", nextSeasonLink);
-                    Console.WriteLine($"➡️  Navigiert zu Staffel {nextSeasonNumber}");
-
-                    // Warte bis Seite geladen ist
-                    await WaitForPageLoad();
-
-                    // Navigiere zur ersten Episode der neuen Staffel
-                    var firstEpisodeUrl = GenerateEpisodeUrl(nextSeasonNumber, 1);
-                    if (firstEpisodeUrl != null)
-                    {
-                        Console.WriteLine($"🌐 Navigiere zur ersten Episode: {firstEpisodeUrl}");
-                        driver.Navigate().GoToUrl(firstEpisodeUrl);
-                        await WaitForPageLoad();
-
-                        // Prüfe ob die Episode-Seite erfolgreich geladen wurde
-                        var pageTitle = driver.Title.ToLower();
-                        if (!pageTitle.Contains("404") && !pageTitle.Contains("not found"))
-                        {
-                            Console.WriteLine($"✅ Erfolgreich zur ersten Episode von Staffel {nextSeasonNumber} navigiert");
-                            return true;
-                        }
-                    }
-                }
-                else
-                {
-                    Console.WriteLine($"❌ Kein Link zu Staffel {nextSeasonNumber} gefunden");
-                }
-
-                // Alternative: URL-basierte Navigation
-                Console.WriteLine("🔄 Versuche URL-basierte Staffel-Navigation...");
-                var currentUrl = driver.Url;
-                var nextSeasonUrl = currentUrl.Replace($"staffel-{currentSeason}", $"staffel-{nextSeasonNumber}")
-                                              .Replace($"episode-", "episode-1"); // Erste Episode der neuen Staffel
-
-                if (nextSeasonUrl != currentUrl)
-                {
-                    Console.WriteLine($"🌐 Teste URL: {nextSeasonUrl}");
-                    driver.Navigate().GoToUrl(nextSeasonUrl);
-                    await WaitForPageLoad();
-
-                    // Prüfe ob Seite existiert (kein 404)
-                    var pageTitle = driver.Title.ToLower();
-                    if (!pageTitle.Contains("404") && !pageTitle.Contains("not found"))
-                    {
-                        Console.WriteLine($"✅ URL-basiert zu Staffel {nextSeasonNumber} navigiert");
-                        return true;
-                    }
-                    else
-                    {
-                        Console.WriteLine($"❌ Staffel {nextSeasonNumber} existiert nicht (404)");
-                    }
-                }
-
-                return false;
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"⚠️  Fehler beim Navigieren zur nächsten Staffel: {ex.Message}");
-                return false;
-            }
-        }
-
-        private static string GenerateEpisodeUrl(int season, int episode)
-        {
-            try
-            {
-                var currentUrl = driver.Url;
-                var uri = new Uri(currentUrl);
-                var segments = uri.Segments.ToList();
-
-                // Finde und ersetze Staffel- und Episode-Segmente
-                for (int i = 0; i < segments.Count; i++)
-                {
-                    if (segments[i].StartsWith("staffel-"))
-                    {
-                        segments[i] = $"staffel-{season}/";
-                    }
-                    else if (segments[i].StartsWith("episode-"))
-                    {
-                        segments[i] = $"episode-{episode}";
-                    }
-                }
-
-                var newUrl = uri.Scheme + "://" + uri.Host + string.Join("", segments);
-                return newUrl;
-            }
-            catch
-            {
-                return null;
-            }
-        }
-
-        private static string GenerateNextEpisodeUrl(string currentUrl)
-        {
-            try
-            {
-                Console.WriteLine($"🔧 Generiere nächste Episode-URL von: {currentUrl}");
-
-                // Pattern für serienstream.to: .../episode-X
-                var uri = new Uri(currentUrl);
-                var segments = uri.Segments;
-
-                for (int i = 0; i < segments.Length; i++)
-                {
-                    if (segments[i].StartsWith("episode-"))
-                    {
-                        var episodeNumberStr = segments[i].Replace("episode-", "").TrimEnd('/');
-                        Console.WriteLine($"🔍 Gefundene Episode-Nummer in URL: '{episodeNumberStr}'");
-
-                        if (int.TryParse(episodeNumberStr, out int currentEpisodeNumber))
-                        {
-                            var nextEpisodeNumber = currentEpisodeNumber + 1;
-                            var nextUrl = currentUrl.Replace($"episode-{currentEpisodeNumber}", $"episode-{nextEpisodeNumber}");
-
-                            Console.WriteLine($"📈 URL-Generation: episode-{currentEpisodeNumber} → episode-{nextEpisodeNumber}");
-                            Console.WriteLine($"🎯 Generierte nächste URL: {nextUrl}");
-
-                            return nextUrl;
-                        }
-                        else
-                        {
-                            Console.WriteLine($"⚠️  Konnte Episode-Nummer nicht parsen: '{episodeNumberStr}'");
-                        }
-                    }
-                }
-
-                Console.WriteLine($"❌ Keine Episode-Nummer in URL gefunden");
-                return null;
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"⚠️  Fehler beim Generieren der nächsten Episode-URL: {ex.Message}");
-                return null;
-            }
-        }
-
-        private static void InitializeYtDlpBatchFile()
-        {
-            var header = @"@echo off
+            var header = $@"@echo off
 setlocal enabledelayedexpansion
-REM ===== yt-dlp Parallel Download System =====
-REM Staffel: " + currentSeason + @"
-REM Generiert am: " + DateTime.Now + @"
-REM Quelle: " + userInputUrl + @"
-REM Maximal 2 parallele Downloads
+REM ===== yt-dlp Download System =====
+REM Serie: {currentSeries.Name}
+REM Staffel: {season.Number}
+REM Generiert am: {DateTime.Now}
+REM Episoden: {episodes.Count}
 
 if not exist ""Downloads"" mkdir Downloads
 cd Downloads
 
-REM Semaphor-System für max 2 parallele Downloads
 set /a running_downloads=0
 set /a max_parallel=2
 
 echo.
-echo 🚀 Starte Download-System für Staffel " + currentSeason + @" (max %max_parallel% parallel)
+echo 🚀 Starte Download-System für {currentSeries.Name} Staffel {season.Number}
 echo ================================================
 echo.
 
-REM Download-Funktion definieren
 goto :start_downloads
 
 :download_episode
 set ""url=%~1""
-set ""temp_name=%~2""
-set ""final_name=%~3""
+set ""final_name=%~2""
 
-REM Warte bis Slot frei ist
 :wait_for_slot
 if !running_downloads! geq %max_parallel% (
     timeout /t 5 /nobreak >nul
     goto :wait_for_slot
 )
 
-REM Slot reservieren
 set /a running_downloads+=1
 echo [!time!] 📥 Start: %final_name% (Slot !running_downloads!/%max_parallel%)
 
-REM Download in Hintergrund starten
-start /b """" cmd /c ""call :do_download ""%url%"" ""%temp_name%"" ""%final_name%""&&set /a running_downloads-=1""
-
+start /b """" cmd /c ""call :do_download ""%url%"" ""%final_name%""&&set /a running_downloads-=1""
 goto :eof
 
 :do_download
 set ""url=%~1""
-set ""temp_name=%~2""
-set ""final_name=%~3""
+set ""final_name=%~2""
 
-REM Eigentlicher yt-dlp Download
 echo [%time%] 🔄 Downloading: %final_name%
-yt-dlp ""%url%"" --output ""%temp_name%%.%%(ext)s"" --merge-output-format mp4 --embed-metadata --no-playlist
+yt-dlp ""%url%"" --output ""%final_name%%.%%(ext)s"" --merge-output-format mp4 --embed-metadata --no-playlist
 
-REM Prüfe ob Download erfolgreich
 if %errorlevel% equ 0 (
-    REM Datei umbenennen
-    for %%f in (""%temp_name%.*"") do (
-        set ""ext=%%~xf""
-        ren ""%%f"" ""%final_name%!ext!""
-        echo [%time%] ✅ Completed: %final_name%!ext!
-    )
+    echo [%time%] ✅ Completed: %final_name%
 ) else (
     echo [%time%] ❌ Failed: %final_name%
 )
 
-REM Slot freigeben
 set /a running_downloads-=1
 goto :eof
 
 :start_downloads
-REM Hier kommen die Download-Aufrufe für Staffel " + currentSeason + @":
+REM Download-Commands:
 
 ";
 
-            File.WriteAllText(batchFilePath, header);
-            Console.WriteLine($"📄 Batch-Datei für Staffel {currentSeason} initialisiert: {batchFilePath}");
-        }
-
-        private static void AddToYtDlpBatch(string m3u8Url)
-        {
-            try
+            var commands = new List<string>();
+            foreach (var episode in episodes.OrderBy(e => e.Number))
             {
-                // Extrahiere Episode-Info aus der aktuellen URL
-                var currentUrl = driver.Url;
-                var (tempName, finalName) = ExtractEpisodeInfo(currentUrl);
-
-                // Batch-Datei: yt-dlp Command mit temporärem Namen und anschließender Umbenennung
-                var command = $"call :download_episode \"{m3u8Url}\" \"{tempName}\" \"{finalName}\"\n";
-                File.AppendAllText(batchFilePath, command);
-
-                Console.WriteLine($"📝 Download-Command hinzugefügt: {finalName}");
+                var fileName = $"{currentSeries.CleanName}S{season.Number:D2}F{episode.Number:D2}";
+                commands.Add($"call :download_episode \"{episode.M3U8Url}\" \"{fileName}\"");
             }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"⚠️  Fehler beim Hinzufügen zur Batch-Datei: {ex.Message}");
-            }
-        }
 
-        private static (string tempName, string finalName) ExtractEpisodeInfo(string url)
-        {
-            try
-            {
-                var uri = new Uri(url);
-                var segments = uri.Segments;
-
-                var serie = "Unknown_Series";
-                var staffel = "1";
-                var episode = "1";
-
-                // Extrahiere aus serienstream.to URL-Struktur
-                for (int i = 0; i < segments.Length; i++)
-                {
-                    if (segments[i] == "stream/" && i + 1 < segments.Length)
-                    {
-                        serie = segments[i + 1].TrimEnd('/').Replace("-", "_");
-                        // Capitalize first letter of each word
-                        serie = System.Globalization.CultureInfo.CurrentCulture.TextInfo.ToTitleCase(serie.Replace("_", " ")).Replace(" ", "_");
-                        Console.WriteLine($"📺 Serie aus URL extrahiert: {serie}");
-                    }
-                    else if (segments[i].StartsWith("staffel-"))
-                    {
-                        staffel = segments[i].Replace("staffel-", "").TrimEnd('/');
-                    }
-                    else if (segments[i].StartsWith("episode-"))
-                    {
-                        episode = segments[i].Replace("episode-", "").TrimEnd('/');
-                    }
-                }
-
-                // Fallback: Versuche aus Page Title zu extrahieren (aber nur als Fallback!)
-                if (serie == "Unknown_Series")
-                {
-                    try
-                    {
-                        var pageTitle = driver.Title;
-                        Console.WriteLine($"🔍 Versuche Serie aus Titel zu extrahieren: {pageTitle}");
-
-                        // Extrahiere Serienname aus Titel wie "Episode 1 Staffel 1 von One Piece"
-                        if (pageTitle.Contains(" von "))
-                        {
-                            var titleParts = pageTitle.Split(new[] { " von " }, StringSplitOptions.RemoveEmptyEntries);
-                            if (titleParts.Length > 1)
-                            {
-                                var seriesName = titleParts[titleParts.Length - 1].Split('|')[0].Trim();
-                                serie = seriesName.Replace(" ", "_").Replace("-", "_");
-                                Console.WriteLine($"📺 Serie aus Titel extrahiert: {serie}");
-                            }
-                        }
-                        // Alternative: Suche nach bekannten Anime-/Serien-Namen im Titel
-                        else
-                        {
-                            // Liste bekannter Serien, die im Titel vorkommen könnten
-                            var knownSeries = new[] { "One Piece", "Naruto", "Dragon Ball", "Attack on Titan", "Demon Slayer" };
-
-                            foreach (var knownSerie in knownSeries)
-                            {
-                                if (pageTitle.ToLower().Contains(knownSerie.ToLower()))
-                                {
-                                    serie = knownSerie.Replace(" ", "_");
-                                    Console.WriteLine($"📺 Bekannte Serie im Titel gefunden: {serie}");
-                                    break;
-                                }
-                            }
-
-                            // Wenn immer noch nicht gefunden, versuche ersten Teil vor bestimmten Keywords
-                            if (serie == "Unknown_Series")
-                            {
-                                var keywords = new[] { ".mp4", " ansehen", " - VOE", " |" };
-                                var titleStart = pageTitle;
-
-                                foreach (var keyword in keywords)
-                                {
-                                    if (titleStart.Contains(keyword))
-                                    {
-                                        titleStart = titleStart.Split(new[] { keyword }, StringSplitOptions.None)[0].Trim();
-                                    }
-                                }
-
-                                // Nehme die ersten 2-3 Wörter als Seriename
-                                var words = titleStart.Split(new[] { '.', ' ' }, StringSplitOptions.RemoveEmptyEntries);
-                                if (words.Length >= 2)
-                                {
-                                    serie = string.Join("_", words.Take(2));
-                                    Console.WriteLine($"📺 Serie aus Titel-Anfang extrahiert: {serie}");
-                                }
-                            }
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"⚠️  Fehler bei Titel-Extraktion: {ex.Message}");
-                    }
-                }
-
-                // Bereinige Seriennamen
-                serie = serie.Replace(".", "_").Replace(",", "_").Replace(":", "_");
-
-                // Temporärer Name für yt-dlp (einfacher)
-                var tempName = $"temp_S{staffel}E{episode}";
-
-                // Finaler Name im gewünschten Format
-                var finalName = $"{serie}S{staffel}F{episode}";
-
-                Console.WriteLine($"📝 Episode-Info: {finalName}");
-                return (tempName, finalName);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"⚠️  Fehler bei Episode-Info-Extraktion: {ex.Message}");
-                var timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
-                return ($"temp_{timestamp}", $"Video_{timestamp}");
-            }
-        }
-
-        private static void FinalizeBatchFile()
-        {
-            var footer = @"
-REM Warte bis alle Downloads abgeschlossen sind
+            var footer = $@"
 :wait_for_completion
 if !running_downloads! gtr 0 (
     echo [%time%] ⏳ Warte auf %running_downloads% laufende Downloads...
@@ -1528,38 +736,334 @@ echo ================================================
 echo 🎉 Alle Downloads abgeschlossen!
 echo.
 echo 📊 Download-Statistik:
-echo    - Insgesamt verarbeitet: " + capturedUrls.Count + @" URLs
+echo    - Serie: {currentSeries.Name}
+echo    - Staffel: {season.Number}
+echo    - Episoden: {episodes.Count}
 echo    - Zielordner: %cd%
-echo    - Format: [SerienName]S[Staffel]F[Folge].mp4
 echo.
 
-REM Zeige heruntergeladene Dateien
-echo 📁 Heruntergeladene Dateien:
-dir /b *.mp4 2>nul || echo    (Keine .mp4 Dateien gefunden)
-
-echo.
+dir /b *.mp4 2>nul && echo. || echo Keine .mp4 Dateien gefunden
 echo ✨ Fertig! Drücken Sie eine Taste zum Beenden...
 pause >nul
 ";
 
-            File.AppendAllText(batchFilePath, footer);
-            Console.WriteLine($"📄 Batch-Datei finalisiert mit {capturedUrls.Count} Downloads");
+            return header + string.Join("\n", commands) + footer;
         }
 
-        private static void CleanupTempProfile(string tempProfilePath)
+        // Utility Functions
+        private static void PrintLiveStats()
+        {
+            lock (statsLock)
+            {
+                if (DateTime.Now - lastStatsUpdate < TimeSpan.FromSeconds(2)) return;
+                lastStatsUpdate = DateTime.Now;
+
+                Console.WriteLine($"📊 Live-Stats: {currentSeries.FoundEpisodes}/{currentSeries.TotalEpisodes} gefunden, " +
+                                $"{currentSeries.ErrorEpisodes} Fehler, " +
+                                $"Laufzeit: {DateTime.Now - currentSeries.StartedAt:mm\\:ss}");
+            }
+        }
+
+        private static void SetupNetworkMonitoring()
+        {
+            var script = @"
+                window.foundM3U8URLs = [];
+                
+                if (window.fetch) {
+                    const originalFetch = window.fetch;
+                    window.fetch = function(...args) {
+                        const url = args[0];
+                        if (typeof url === 'string' && url.includes('.m3u8')) {
+                            window.foundM3U8URLs.push(url);
+                        }
+                        return originalFetch.apply(this, args);
+                    };
+                }
+                
+                const originalOpen = XMLHttpRequest.prototype.open;
+                XMLHttpRequest.prototype.open = function(method, url, ...args) {
+                    if (typeof url === 'string' && url.includes('.m3u8')) {
+                        window.foundM3U8URLs.push(url);
+                    }
+                    return originalOpen.apply(this, [method, url, ...args]);
+                };
+            ";
+
+            ((IJavaScriptExecutor)driver).ExecuteScript(script);
+            Console.WriteLine("📡 Netzwerk-Monitoring aktiviert");
+        }
+
+        private static void SetupVideoPageNetworkMonitoring()
+        {
+            var script = @"
+                window.foundM3U8URLs = window.foundM3U8URLs || [];
+                
+                if (window.fetch) {
+                    const originalFetch = window.fetch;
+                    window.fetch = function(...args) {
+                        const url = args[0];
+                        if (typeof url === 'string' && url.includes('.m3u8')) {
+                            window.foundM3U8URLs.push(url);
+                            console.log('*** M3U8 found on video page:', url);
+                        }
+                        return originalFetch.apply(this, args);
+                    };
+                }
+            ";
+
+            ((IJavaScriptExecutor)driver).ExecuteScript(script);
+        }
+
+        private static bool IsValidM3U8Url(string url)
+        {
+            if (string.IsNullOrEmpty(url)) return false;
+            if (!url.Contains(".m3u8")) return false;
+            if (url.Contains("analytics") || url.Contains("tracking")) return false;
+            if (!url.StartsWith("http://") && !url.StartsWith("https://")) return false;
+            return true;
+        }
+
+        private static string ExtractSeriesNameFromUrl(string url)
         {
             try
             {
-                if (!string.IsNullOrEmpty(tempProfilePath) && Directory.Exists(tempProfilePath))
+                var uri = new Uri(url);
+                var segments = uri.Segments;
+
+                for (int i = 0; i < segments.Length; i++)
                 {
-                    Directory.Delete(tempProfilePath, true);
+                    if (segments[i] == "stream/" && i + 1 < segments.Length)
+                    {
+                        var rawName = segments[i + 1].TrimEnd('/').Replace("-", " ");
+                        return System.Globalization.CultureInfo.CurrentCulture.TextInfo.ToTitleCase(rawName);
+                    }
+                }
+
+                return "Unknown Series";
+            }
+            catch
+            {
+                return "Unknown Series";
+            }
+        }
+
+        private static string CleanFileName(string name)
+        {
+            var invalid = Path.GetInvalidFileNameChars();
+            return string.Join("_", name.Split(invalid, StringSplitOptions.RemoveEmptyEntries)).Trim();
+        }
+
+        private static int GetSeasonFromUrl(string url)
+        {
+            try
+            {
+                var match = Regex.Match(url, @"/staffel-(\d+)/", RegexOptions.IgnoreCase);
+                return match.Success && int.TryParse(match.Groups[1].Value, out int season) ? season : 1;
+            }
+            catch { return 1; }
+        }
+
+        private static int GetEpisodeFromUrl(string url)
+        {
+            try
+            {
+                var match = Regex.Match(url, @"/episode-(\d+)", RegexOptions.IgnoreCase);
+                return match.Success && int.TryParse(match.Groups[1].Value, out int episode) ? episode : 1;
+            }
+            catch { return 1; }
+        }
+
+        private static string GetEpisodeTitle()
+        {
+            try
+            {
+                var title = driver.Title;
+                var parts = title.Split(new[] { " | ", " - " }, StringSplitOptions.RemoveEmptyEntries);
+                return parts.Length > 0 ? parts[0].Trim() : "";
+            }
+            catch { return ""; }
+        }
+
+        // Navigation
+        private static async Task<bool> NavigateToNextEpisode()
+        {
+            try
+            {
+                var originalUrl = driver.Url;
+                var episodeLinks = driver.FindElements(By.CssSelector("a[data-episode-id]"));
+
+                if (episodeLinks.Count > 0)
+                {
+                    var activeLink = episodeLinks.FirstOrDefault(link =>
+                        link.GetAttribute("class")?.Contains("active") == true);
+
+                    if (activeLink != null)
+                    {
+                        var activeIndex = episodeLinks.ToList().IndexOf(activeLink);
+                        if (activeIndex + 1 < episodeLinks.Count)
+                        {
+                            var nextLink = episodeLinks[activeIndex + 1];
+                            ((IJavaScriptExecutor)driver).ExecuteScript("arguments[0].click();", nextLink);
+                            await WaitForPageLoad();
+                            return driver.Url != originalUrl;
+                        }
+                    }
+                }
+
+                // Fallback: URL-basierte Navigation
+                var currentEpisode = GetEpisodeFromUrl(driver.Url);
+                var nextUrl = driver.Url.Replace($"episode-{currentEpisode}", $"episode-{currentEpisode + 1}");
+
+                if (nextUrl != driver.Url)
+                {
+                    driver.Navigate().GoToUrl(nextUrl);
+                    await WaitForPageLoad();
+
+                    var title = driver.Title.ToLower();
+                    return !title.Contains("404") && !title.Contains("not found");
+                }
+
+                return false;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"⚠️  Navigation Fehler: {ex.Message}");
+                return false;
+            }
+        }
+
+        private static async Task<bool> TryNavigateToNextSeason(int currentSeason)
+        {
+            try
+            {
+                var nextSeason = currentSeason + 1;
+                var currentUrl = driver.Url;
+                var nextSeasonUrl = currentUrl.Replace($"staffel-{currentSeason}", $"staffel-{nextSeason}")
+                                             .Replace($"episode-", "episode-1");
+
+                driver.Navigate().GoToUrl(nextSeasonUrl);
+                await WaitForPageLoad();
+
+                var title = driver.Title.ToLower();
+                return !title.Contains("404") && !title.Contains("not found");
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        // Browser Management
+        private static ChromeDriver CreateChromeDriver()
+        {
+            var options = new ChromeOptions();
+            options.AddArgument("--headless");
+            options.AddArgument("--disable-blink-features=AutomationControlled");
+            options.AddExcludedArgument("enable-automation");
+            options.AddAdditionalOption("useAutomationExtension", false);
+            options.AddArgument("--disable-web-security");
+            options.AddArgument("--disable-gpu");
+            options.AddArgument("--no-sandbox");
+            options.AddArgument("--disable-dev-shm-usage");
+            options.AddArgument("--disable-logging");
+            options.AddArgument("--log-level=3");
+            options.AddArgument("--silent");
+
+            if (!string.IsNullOrEmpty(tempProfilePath))
+            {
+                options.AddArgument($"--user-data-dir={tempProfilePath}");
+            }
+
+            var service = ChromeDriverService.CreateDefaultService();
+            service.SuppressInitialDiagnosticInformation = true;
+            service.HideCommandPromptWindow = true;
+
+            return new ChromeDriver(service, options);
+        }
+
+        private static async Task<bool> WaitForPageLoad()
+        {
+            try
+            {
+                var wait = new WebDriverWait(driver, TimeSpan.FromSeconds(6)); // OPTIMIERT: 6s statt 8s
+                wait.Until(driver => ((IJavaScriptExecutor)driver)
+                    .ExecuteScript("return document.readyState").Equals("complete"));
+                await Task.Delay(600); // OPTIMIERT: 0.6s statt 0.8s
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"⚠️  Page Load Timeout: {ex.Message}");
+                return false;
+            }
+        }
+
+        private static void SetupTempProfile()
+        {
+            try
+            {
+                tempProfilePath = Path.Combine(Path.GetTempPath(), $"M3U8Extractor_{Guid.NewGuid():N}");
+                Directory.CreateDirectory(tempProfilePath);
+                Console.WriteLine("🔇 Temporäres Browser-Profil erstellt");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"⚠️  Temporäres Profil Fehler: {ex.Message}");
+            }
+        }
+
+        private static void CleanupTempProfile(string tempPath)
+        {
+            try
+            {
+                if (!string.IsNullOrEmpty(tempPath) && Directory.Exists(tempPath))
+                {
+                    Directory.Delete(tempPath, true);
                     Console.WriteLine("🧹 Temporäres Profil bereinigt");
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"⚠️  Fehler beim Bereinigen des temporären Profils: {ex.Message}");
+                Console.WriteLine($"⚠️  Cleanup Fehler: {ex.Message}");
             }
+        }
+
+        private static void ShowFinalResults()
+        {
+            Console.WriteLine();
+            //Console.WriteLine("=" * 60);
+            Console.WriteLine($"🎉 EXTRAKTION ABGESCHLOSSEN");
+            //Console.WriteLine("=" * 60);
+            Console.WriteLine($"📺 Serie: {currentSeries.Name}");
+            Console.WriteLine($"⏱️  Laufzeit: {DateTime.Now - currentSeries.StartedAt:hh\\:mm\\:ss}");
+            Console.WriteLine($"📊 Staffeln: {currentSeries.Seasons.Count}");
+            Console.WriteLine($"📈 Episoden: {currentSeries.FoundEpisodes}/{currentSeries.TotalEpisodes} erfolgreich");
+            Console.WriteLine($"❌ Fehler: {currentSeries.ErrorEpisodes}");
+            Console.WriteLine();
+
+            foreach (var season in currentSeries.Seasons.OrderBy(s => s.Number))
+            {
+                Console.WriteLine($"   🎬 Staffel {season.Number}: {season.FoundEpisodes}/{season.TotalEpisodes} Episoden");
+            }
+
+            Console.WriteLine();
+            Console.WriteLine("📄 Generierte Dateien:");
+            Console.WriteLine($"   📊 {currentSeries.CleanName}_episodes.csv");
+            Console.WriteLine($"   💾 {currentSeries.CleanName}_extraction.json");
+
+            foreach (var season in currentSeries.Seasons.Where(s => s.FoundEpisodes > 0))
+            {
+                Console.WriteLine($"   🎬 {currentSeries.CleanName}_S{season.Number:D2}_yt-dlp.bat");
+            }
+
+            Console.WriteLine();
+            Console.WriteLine("🎯 VERWENDUNG:");
+            Console.WriteLine("   • Führen Sie die .bat Dateien für automatische Downloads aus");
+            Console.WriteLine("   • Öffnen Sie die .json Datei für detaillierte Informationen");
+            Console.WriteLine("   • Importieren Sie die .csv Datei in Excel/Sheets für Analyse");
+            Console.WriteLine();
+            Console.WriteLine("Drücken Sie eine Taste zum Beenden...");
+            Console.ReadKey();
         }
 
         private static void LogError(string message)
@@ -1567,9 +1071,12 @@ pause >nul
             errorCount++;
             Console.WriteLine($"❌ Fehler {errorCount}/{maxErrors}: {message}");
 
-            // Optional: In Log-Datei schreiben
-            var logEntry = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] ERROR {errorCount}: {message}\n";
-            File.AppendAllText("errors.log", logEntry);
+            try
+            {
+                var logEntry = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] ERROR {errorCount}: {message}\n";
+                File.AppendAllText("errors.log", logEntry);
+            }
+            catch { }
         }
     }
 }
