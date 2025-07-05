@@ -11,6 +11,8 @@
         public int StartSeason { get; set; } = 1;
         public int StartEpisode { get; set; } = 1;
         public int? MaxEpisodes { get; set; }
+        public bool ForceRescrape { get; set; } = false;
+        public bool SkipExisting {  get; set; } = true;
 
         public bool IsValid => !string.IsNullOrEmpty(Url);
 

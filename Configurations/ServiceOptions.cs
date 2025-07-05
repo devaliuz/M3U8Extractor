@@ -17,6 +17,7 @@ namespace YtDlpExtractor.Configuration
         public int DelayAfterError { get; set; } = 2000; // Milliseconds
         public bool ContinueOnError { get; set; } = true;
         public bool SkipExistingEpisodes { get; set; } = false;
+        public bool ForceRescrape {  get; set; } = false;
 
         public void Validate()
         {
